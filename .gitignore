@@ -1,0 +1,12 @@
+# Virtual Environments & Caches
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# Dependencies & Build Outputs
+frontend/node_modules/
+frontend/dist/
+
+# System / OS junk
+.DS_Store
+Thumbs.db
