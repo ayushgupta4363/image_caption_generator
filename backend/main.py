@@ -4,6 +4,10 @@ import pickle
 import traceback
 import numpy as np
 import gc
+import warnings
+
+# Suppress non-critical Keras/TF backend warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="keras")
 
 # 1. Disable GPU searches completely to save memory
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -15,7 +19,6 @@ import tensorflow as tf
 tf.config.threading.set_inter_op_parallelism_threads(1)
 tf.config.threading.set_intra_op_parallelism_threads(1)
 
-# ... Rest of your FastAPI routes and model loading code ...
 from PIL import Image
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -58,14 +61,14 @@ def build_caption_model():
     Outputs: 8768-dim vocabulary probabilities
     """
     # 1. Image feature extractor branch
-    inputs1 = Input(shape=(4096,), name="input_layer_10")
+    inputs1 = Input(shape=(4096,), name="input_layer_10", dtype=tf.float32)
     fe1 = Dropout(0.5, name="dropout_8")(inputs1)
     fe2 = Dense(256, activation="relu", name="dense_10")(fe1)
     fe3 = RepeatVector(MAX_LENGTH, name="repeat_vector_4")(fe2)
 
     # 2. Text sequence branch
-    inputs2 = Input(shape=(MAX_LENGTH,), name="input_layer_11")
-    se1 = Embedding(VOCAB_SIZE, 256, mask_zero=True, name="embedding_4")(inputs2)
+    inputs2 = Input(shape=(MAX_LENGTH,), name="input_layer_11", dtype=tf.float32)
+    se1 = Embedding(VOCAB_SIZE, 256, mask_zero=False, name="embedding_4")(inputs2)
     se2 = Dropout(0.5, name="dropout_9")(se1)
 
     # 3. Recurrent Attention branch
@@ -81,11 +84,13 @@ def build_caption_model():
     attn_weights = Activation("softmax", name="activation_4")(dot_prod)
 
     # 5. Lambda layers (Einsum & Sum Reduction)
+    # Discard any masking metadata attached to bi_lstm2 before einsum
     context_mat = Lambda(
-        lambda x: tf.einsum("ijk,ijl->ikl", x[0], x[1]), name="lambda_7"
+        lambda x: tf.einsum("ijk,ijl->ikl", x[0], tf.identity(x[1])), name="lambda_7"
     )([attn_weights, bi_lstm2])
+    
     context_vector = Lambda(
-        lambda x: tf.reduce_sum(x, axis=1), name="lambda_8"
+        lambda x: tf.reduce_sum(tf.identity(x), axis=1), name="lambda_8"
     )(context_mat)
 
     # 6. Decoder & Dense Classifier
@@ -114,10 +119,9 @@ def preload_models():
         raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
 
     try:
-        # Load weights safely into reconstructed architecture
         caption_model = build_caption_model()
         caption_model.load_weights(MODEL_PATH)
-        print("Caption Model loaded without C++ crash!")
+        print("Caption Model loaded cleanly without errors!")
     except Exception as e:
         print(f"Fallback loading mode triggered: {e}")
         caption_model = tf.keras.models.load_model(MODEL_PATH, safe_mode=False)
@@ -144,14 +148,18 @@ def extract_features(image_bytes: bytes) -> np.ndarray:
     img_array = np.expand_dims(img_array, axis=0)
     img_array = preprocess_input(img_array)
     
-    # Extract feature vector as a numpy array
+    # Extract feature vector as numpy array
     features = feature_extractor(img_array, training=False)
     if isinstance(features, tf.Tensor):
         features = features.numpy()
     return features
 
 
-def generate_caption(image_features: np.ndarray) -> str:
+def generate_caption_advanced(
+    image_features: np.ndarray, 
+    beam_width: int = 3, 
+    repetition_penalty: float = 1.25
+) -> str:
     start_token = "startseq"
     if hasattr(tokenizer, "word_index"):
         if "startseq" in tokenizer.word_index:
@@ -159,41 +167,105 @@ def generate_caption(image_features: np.ndarray) -> str:
         elif "start" in tokenizer.word_index:
             start_token = "start"
 
-    in_text = start_token
+    feat_tensor = tf.cast(tf.convert_to_tensor(image_features), dtype=tf.float32)
+    if len(feat_tensor.shape) == 1:
+        feat_tensor = tf.expand_dims(feat_tensor, axis=0)
 
-    # Ensure image_features is a tensor of float32
-    feat_tensor = tf.convert_to_tensor(image_features, dtype=tf.float32)
+    start_idx = tokenizer.texts_to_sequences([start_token])[0][0]
+    beams = [([start_idx], 0.0)]
+    
+    stop_indices = {
+        tokenizer.word_index[w]
+        for w in ["endseq", "end", "<end>", "[END]"]
+        if hasattr(tokenizer, "word_index") and w in tokenizer.word_index
+    }
 
-    for _ in range(MAX_LENGTH):
-        seq = tokenizer.texts_to_sequences([in_text])
-        if not seq or not seq[0]:
+    for _ in range(MAX_LENGTH - 1):
+        candidates = []
+        for seq, score in beams:
+            if seq[-1] in stop_indices:
+                candidates.append((seq, score))
+                continue
+
+            padded_seq = pad_sequences([seq], maxlen=MAX_LENGTH, padding="pre")
+            seq_tensor = tf.cast(tf.convert_to_tensor(padded_seq), dtype=tf.float32)
+
+            # Predict next token probabilities cleanly
+            preds = caption_model([feat_tensor, seq_tensor], training=False).numpy()[0]
+            
+            # Penalize token repetition within sequence
+            for token_id in set(seq):
+                if preds[token_id] > 0:
+                    preds[token_id] /= repetition_penalty
+
+            # Suppress immediate consecutive duplicate word loop
+            last_token = seq[-1]
+            if last_token in range(len(preds)):
+                preds[last_token] /= 10.0
+
+            # Renormalize probabilities safely
+            preds_sum = np.sum(preds)
+            if preds_sum > 0:
+                preds = preds / preds_sum
+
+            top_k_indices = np.argsort(preds)[-beam_width:]
+
+            for idx in top_k_indices:
+                prob = np.maximum(preds[idx], 1e-10)
+                candidates.append((seq + [idx], score + np.log(prob)))
+
+        ordered = sorted(
+            candidates, 
+            key=lambda x: x[1] / (len(x[0]) ** 0.7), 
+            reverse=True
+        )
+        beams = ordered[:beam_width]
+
+        if all(b[0][-1] in stop_indices for b in beams):
             break
 
-        padded_seq = pad_sequences([seq[0]], maxlen=MAX_LENGTH, padding="post")
-        
-        # Convert text sequence to tensor as well (matching input types)
-        seq_tensor = tf.convert_to_tensor(padded_seq, dtype=tf.float32)
+    best_seq = beams[0][0]
 
-        # Call model with matching tensor inputs
-        yhat = caption_model([feat_tensor, seq_tensor], training=False)
-        
-        idx = int(np.argmax(yhat.numpy()))
-        word = index_to_word.get(idx, None)
+    ignore_tokens = {"startseq", "endseq", "<start>", "<end>", "start", "end", "<pad>"}
+    words = []
+    for idx in best_seq:
+        w = index_to_word.get(idx, "")
+        if w and w.lower() not in ignore_tokens:
+            words.append(w)
 
-        if word is None:
+    return " ".join(words).strip()
+
+
+def generate_caption_greedy(image_features: np.ndarray) -> str:
+    in_text = "startseq"
+    feat_tensor = tf.cast(tf.convert_to_tensor(image_features), dtype=tf.float32)
+    if len(feat_tensor.shape) == 1:
+        feat_tensor = tf.expand_dims(feat_tensor, axis=0)
+
+    for _ in range(MAX_LENGTH):
+        sequence = tokenizer.texts_to_sequences([in_text])[0]
+        sequence = pad_sequences([sequence], maxlen=MAX_LENGTH, padding="pre")
+        seq_tensor = tf.cast(tf.convert_to_tensor(sequence), dtype=tf.float32)
+
+        yhat = caption_model([feat_tensor, seq_tensor], training=False).numpy()[0]
+        yhat_idx = np.argmax(yhat)
+        word = index_to_word.get(yhat_idx, "")
+
+        if not word or word in ["endseq", "end", "<end>"]:
             break
 
         in_text += " " + word
 
-        if word in ["endseq", "end", "<end>", "[END]"]:
-            break
+    words = [w for w in in_text.split() if w.lower() not in {"startseq", "endseq"}]
+    return " ".join(words)
 
-    cleaned = in_text
-    for tag in ["startseq", "endseq", "<start>", "<end>", "start", "end"]:
-        cleaned = cleaned.replace(tag, "")
 
-    return cleaned.strip()
-        
+def generate_caption(image_features: np.ndarray) -> str:
+    try:
+        return generate_caption_advanced(image_features, beam_width=3, repetition_penalty=1.25)
+    except Exception as e:
+        print(f"[FALLBACK] Beam search failed: {e}")
+        return generate_caption_greedy(image_features)
 
 
 @app.get("/")
