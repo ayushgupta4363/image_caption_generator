@@ -3,26 +3,30 @@ import io
 import pickle
 import traceback
 import numpy as np
-import gc
 import warnings
+from dotenv import load_dotenv
+
+# 1. Load environment variables from the .env file
+load_dotenv()
 
 # Suppress non-critical Keras/TF backend warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="keras")
 
-# 1. Disable GPU searches completely to save memory
+# Disable GPU searches completely to save memory
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import tensorflow as tf
 
-# 2. Limit TensorFlow thread usage (prevents high memory spikes)
+# Limit TensorFlow thread usage to avoid memory spikes
 tf.config.threading.set_inter_op_parallelism_threads(1)
 tf.config.threading.set_intra_op_parallelism_threads(1)
 
 from PIL import Image
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from huggingface_hub import hf_hub_download
+
 from tensorflow.keras.applications.vgg16 import VGG16, preprocess_input
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
@@ -41,9 +45,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "my_model.keras")
-TOKENIZER_PATH = os.path.join(BASE_DIR, "tokenizer.pkl")
+# Hugging Face Configuration
+HF_MODEL_ID = os.getenv("HF_MODEL_ID")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 
 feature_extractor = None
 caption_model = None
@@ -51,7 +55,7 @@ tokenizer = None
 index_to_word = {}
 
 MAX_LENGTH = 34
-VOCAB_SIZE = 8768  # From your model metadata
+VOCAB_SIZE = 8768
 
 
 def build_caption_model():
@@ -84,7 +88,6 @@ def build_caption_model():
     attn_weights = Activation("softmax", name="activation_4")(dot_prod)
 
     # 5. Lambda layers (Einsum & Sum Reduction)
-    # Discard any masking metadata attached to bi_lstm2 before einsum
     context_mat = Lambda(
         lambda x: tf.einsum("ijk,ijl->ikl", x[0], tf.identity(x[1])), name="lambda_7"
     )([attn_weights, bi_lstm2])
@@ -108,37 +111,53 @@ def preload_models():
 
     print("\n--- [STARTUP] Loading Models ---")
 
+    if not HF_MODEL_ID or not HF_API_TOKEN:
+        print("[WARNING] HF_MODEL_ID or HF_API_TOKEN not found in .env file!")
+
     # 1. Load VGG16
     print("[1/3] Loading VGG16 Feature Extractor...")
     vgg = VGG16()
     feature_extractor = Model(inputs=vgg.inputs, outputs=vgg.layers[-2].output)
 
-    # 2. Build model in python and load weights safely
-    print(f"[2/3] Re-building and loading model weights from {MODEL_PATH}...")
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
-
+    # 2. Download and load model weights from Hugging Face Hub (or fallback locally)
+    print(f"[2/3] Downloading model weights from HF Hub ({HF_MODEL_ID})...")
     try:
+        model_path = hf_hub_download(
+            repo_id=HF_MODEL_ID,
+            filename="my_model.keras",
+            token=HF_API_TOKEN
+        )
         caption_model = build_caption_model()
-        caption_model.load_weights(MODEL_PATH)
-        print("Caption Model loaded cleanly without errors!")
+        caption_model.load_weights(model_path)
+        print("Caption Model loaded successfully from Hugging Face!")
     except Exception as e:
-        print(f"Fallback loading mode triggered: {e}")
-        caption_model = tf.keras.models.load_model(MODEL_PATH, safe_mode=False)
+        print(f"[FALLBACK] Failed to load from HF Hub ({e}). Looking for local file...")
+        local_model_path = os.path.join(os.path.dirname(__file__), "my_model.keras")
+        caption_model = build_caption_model()
+        caption_model.load_weights(local_model_path)
 
-    # 3. Load Tokenizer
-    print(f"[3/3] Loading Tokenizer from {TOKENIZER_PATH}...")
-    if not os.path.exists(TOKENIZER_PATH):
-        raise FileNotFoundError(f"Tokenizer not found at {TOKENIZER_PATH}")
-    with open(TOKENIZER_PATH, "rb") as f:
-        tokenizer = pickle.load(f)
+    # 3. Download and load Tokenizer from Hugging Face Hub
+    print(f"[3/3] Downloading Tokenizer from HF Hub ({HF_MODEL_ID})...")
+    try:
+        tokenizer_path = hf_hub_download(
+            repo_id=HF_MODEL_ID,
+            filename="tokenizer.pkl",
+            token=HF_API_TOKEN
+        )
+        with open(tokenizer_path, "rb") as f:
+            tokenizer = pickle.load(f)
+    except Exception as e:
+        print(f"[FALLBACK] Failed to load tokenizer from HF Hub ({e}). Looking for local file...")
+        local_tokenizer_path = os.path.join(os.path.dirname(__file__), "tokenizer.pkl")
+        with open(local_tokenizer_path, "rb") as f:
+            tokenizer = pickle.load(f)
 
     if hasattr(tokenizer, "word_index"):
         index_to_word = {idx: word for word, idx in tokenizer.word_index.items()}
     elif hasattr(tokenizer, "index_word"):
         index_to_word = tokenizer.index_word
 
-    print("--- [STARTUP COMPLETE] All models loaded into memory! ---\n")
+    print("--- [STARTUP COMPLETE] Ready for predictions! ---\n")
 
 
 def extract_features(image_bytes: bytes) -> np.ndarray:
@@ -148,7 +167,6 @@ def extract_features(image_bytes: bytes) -> np.ndarray:
     img_array = np.expand_dims(img_array, axis=0)
     img_array = preprocess_input(img_array)
     
-    # Extract feature vector as numpy array
     features = feature_extractor(img_array, training=False)
     if isinstance(features, tf.Tensor):
         features = features.numpy()
@@ -190,20 +208,16 @@ def generate_caption_advanced(
             padded_seq = pad_sequences([seq], maxlen=MAX_LENGTH, padding="pre")
             seq_tensor = tf.cast(tf.convert_to_tensor(padded_seq), dtype=tf.float32)
 
-            # Predict next token probabilities cleanly
             preds = caption_model([feat_tensor, seq_tensor], training=False).numpy()[0]
             
-            # Penalize token repetition within sequence
             for token_id in set(seq):
                 if preds[token_id] > 0:
                     preds[token_id] /= repetition_penalty
 
-            # Suppress immediate consecutive duplicate word loop
             last_token = seq[-1]
             if last_token in range(len(preds)):
                 preds[last_token] /= 10.0
 
-            # Renormalize probabilities safely
             preds_sum = np.sum(preds)
             if preds_sum > 0:
                 preds = preds / preds_sum
@@ -236,36 +250,8 @@ def generate_caption_advanced(
     return " ".join(words).strip()
 
 
-def generate_caption_greedy(image_features: np.ndarray) -> str:
-    in_text = "startseq"
-    feat_tensor = tf.cast(tf.convert_to_tensor(image_features), dtype=tf.float32)
-    if len(feat_tensor.shape) == 1:
-        feat_tensor = tf.expand_dims(feat_tensor, axis=0)
-
-    for _ in range(MAX_LENGTH):
-        sequence = tokenizer.texts_to_sequences([in_text])[0]
-        sequence = pad_sequences([sequence], maxlen=MAX_LENGTH, padding="pre")
-        seq_tensor = tf.cast(tf.convert_to_tensor(sequence), dtype=tf.float32)
-
-        yhat = caption_model([feat_tensor, seq_tensor], training=False).numpy()[0]
-        yhat_idx = np.argmax(yhat)
-        word = index_to_word.get(yhat_idx, "")
-
-        if not word or word in ["endseq", "end", "<end>"]:
-            break
-
-        in_text += " " + word
-
-    words = [w for w in in_text.split() if w.lower() not in {"startseq", "endseq"}]
-    return " ".join(words)
-
-
 def generate_caption(image_features: np.ndarray) -> str:
-    try:
-        return generate_caption_advanced(image_features, beam_width=3, repetition_penalty=1.25)
-    except Exception as e:
-        print(f"[FALLBACK] Beam search failed: {e}")
-        return generate_caption_greedy(image_features)
+    return generate_caption_advanced(image_features, beam_width=3, repetition_penalty=1.25)
 
 
 @app.get("/")
