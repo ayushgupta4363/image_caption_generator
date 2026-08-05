@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import './App.css';
 
+// Live GCP Cloud Run Endpoint
+const API_URL = 'https://image-caption-api-694787194678.us-central1.run.app/predict';
+
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
@@ -52,7 +55,7 @@ function App() {
     }
   };
 
-  // 2. Fetch Prediction from FastAPI
+  // 2. Fetch Prediction from Google Cloud Run
   const generateCaption = async () => {
     if (!selectedFile) return;
 
@@ -64,21 +67,30 @@ function App() {
     formData.append('file', selectedFile);
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/predict', {
+      const response = await fetch(API_URL, {
         method: 'POST',
         body: formData,
       });
 
+      if (!response.ok) {
+        throw new Error(`Server returned status code ${response.status}`);
+      }
+
       const data = await response.json();
 
-      if (response.ok && data.success) {
-        setCaption(data.caption);
+      // Flexible extraction to match various FastAPI JSON response keys
+      const predictedCaption = data.caption || data.result || data.generated_caption;
+
+      if (predictedCaption) {
+        setCaption(predictedCaption);
+      } else if (data.error) {
+        setError(data.error);
       } else {
-        setError(data.error || 'Failed to generate caption.');
+        setError('Received an unexpected response format from server.');
       }
     } catch (err) {
       console.error(err);
-      setError('Cannot connect to backend server. Make sure FastAPI is running on port 8000.');
+      setError('Failed to connect to Google Cloud Run backend. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -114,11 +126,7 @@ function App() {
         <div className="logo-badge">
           <span className="logo-icon">✨</span>
           <span className="logo-text">VisionCaption AI</span>
-          {/* <span className="version-tag">v1.0 • Beta</span> */}
         </div>
-        {/* <div className="status-indicator">
-          <span className="dot"></span> Backend Connected
-        </div> */}
       </nav>
 
       <div className="app-container">
